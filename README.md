@@ -1,83 +1,32 @@
 # bb-plugin-memory-ui
 
-A BB plugin.
+A browsing and curation UI for [bb](https://getbb.app)'s agent memory.
 
-## UI components
+bb's official memory plugin stores memories well and exposes a CLI, but its only UI is a
+settings table — you can't search from it, you can't see a record's history, and deleting
+there records no reason. This adds the surface that makes the store reviewable by a human.
 
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
-
-```
-npx shadcn add @bb/dialog @bb/select
+```sh
+bb plugin install git:https://github.com/MGrin/bb-plugin-memory-ui.git@main
 ```
 
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Ship `dist/` (npm tarball or committed for git installs) so
-people installing your plugin never need npm.
+Requires the official `memory` plugin (`bb plugin install memory`) — this reads its store.
 
-## Manifest
+## What it gives you
 
-`package.json` is the plugin manifest. Notable fields:
+**Memory panel** — list by scope (global / project), full-text search, and a record view
+with its full version history. Edit inline, pin what matters, and forget with a required
+reason so the audit trail survives.
 
-- `bb.server` — backend entry (required); optional `bb.app` for a frontend.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — supported plugin SDK range (scaffold: `^0.4.1`).
+**Homepage section** — your pinned memories, where you'll see them.
 
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` (and, with `bb.app`, `app.js` /
-`app.css` / `app.meta.json`). Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
+## Why reasons are required
 
-## Install
+Agent memory only stays useful if a human can prune it, and pruning is only safe if you
+can see what changed and why. Every mutation here takes a reason and writes a history
+entry, matching what `bb memory forget --reason` does on the CLI rather than dropping the
+record silently.
 
-From this directory:
+## License
 
-```
-bb plugin install .
-```
-
-After editing sources, reload:
-
-```
-bb plugin reload memory-ui
-```
-
-## Configure
-
-```
-bb plugin config memory-ui
-bb plugin config memory-ui set greeting hi
-```
-
-## Types & API reference
-
-`types/bb-plugin-sdk.d.ts` (and `types/bb-plugin-sdk-app.d.ts` for the
-frontend) are the full, bundled BB plugin API — `tsconfig.json` maps
-`@bb/plugin-sdk` to them, so your editor and `tsc` see real types with no extra
-install. They are readable declarations: open them for an exact signature.
-
-The SDK surface grows with every BB release, and these are a copy. Refresh
-them from the BB you are running:
-
-```
-bb plugin types          # rewrite types/ from this BB
-bb plugin types --check  # CI: fail when they are out of date
-```
-
-`bb plugin build` and `bb plugin dev` refresh them for you. Ask BB to write
-plugins for you: the `bb-plugin-authoring` skill documents the whole surface
-with examples.
-
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+MIT
