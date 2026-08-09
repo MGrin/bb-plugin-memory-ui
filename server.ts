@@ -175,7 +175,19 @@ export default async function plugin(bb: BbPluginApi) {
       : view === "pinned"
         ? "m.deleted_at IS NULL AND m.pinned = 1"
         : view === "unused"
-          ? "m.deleted_at IS NULL AND COALESCE(m.access_count,0) = 0"
+          // This is a DELETE-ME list, so it must not contain records that are
+          // merely UNCOUNTABLE. A pinned memory is injected directly rather
+          // than recalled through search, so its access_count never moves —
+          // which put the merge embargo and the production guardrail at the top
+          // of this list, sorted first, inviting exactly the deletion they
+          // exist to prevent (found 2026-08-10). A pin is already an explicit
+          // "this matters" and can never be evidence of the opposite.
+          //
+          // Records younger than a week are excluded for the same reason in a
+          // different tense: nothing written last night has had a chance to be
+          // used yet.
+          ? "m.deleted_at IS NULL AND COALESCE(m.access_count,0) = 0 AND COALESCE(m.pinned,0) = 0" +
+            " AND COALESCE(m.updated_at,0) < (strftime('%s','now') - 7*86400) * 1000"
           : "m.deleted_at IS NULL";
 
   bb.rpc.register(rpcContract, {
@@ -220,12 +232,17 @@ export default async function plugin(bb: BbPluginApi) {
 
     async stats() {
       const one = async (sql: string) => (await sq<{ c: number }>(sql))[0]?.c ?? 0;
+      // Every count comes from viewClause, the same predicate the list uses.
+      // They were separate copies until 2026-08-10, so tightening the "never
+      // used" rule would have left the sidebar badge showing the old number —
+      // a count that disagrees with the list it labels is worse than no count.
+      const countOf = (view: string) => one(`SELECT COUNT(*) c FROM memories m WHERE ${viewClause(view)}`);
       const [active, glob, pinned, unused, forgotten] = await Promise.all([
-        one("SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL"),
-        one("SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL AND scope='global'"),
-        one("SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL AND pinned=1"),
-        one("SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL AND COALESCE(access_count,0)=0"),
-        one("SELECT COUNT(*) c FROM memories WHERE deleted_at IS NOT NULL"),
+        countOf("active"),
+        one("SELECT COUNT(*) c FROM memories m WHERE m.deleted_at IS NULL AND m.scope='global'"),
+        countOf("pinned"),
+        countOf("unused"),
+        countOf("forgotten"),
       ]);
       const counts = await sq<{ project_id: string; c: number }>(
         `SELECT project_id, COUNT(*) c FROM memories

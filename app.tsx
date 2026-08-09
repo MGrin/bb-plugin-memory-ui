@@ -144,7 +144,10 @@ function MemoryPanel() {
           <SideItem label="All memories" count={stats?.active} active={view === "active" && !projectId && scope === "all"}
             onClick={() => { setView("active"); setProjectId(null); setScope("all"); }} />
           <SideItem label="Pinned" count={stats?.pinned} active={view === "pinned"} onClick={() => setView("pinned")} />
-          <SideItem label="Never used" count={stats?.unused} active={view === "unused"} onClick={() => setView("unused")} />
+          {/* Not "Never used": pinned records read as never-used because they are
+              injected rather than recalled, and a record written yesterday has
+              not had its chance yet. Both are excluded, so the label says so. */}
+          <SideItem label="Unused 7d+" count={stats?.unused} active={view === "unused"} onClick={() => setView("unused")} />
           <SideItem label="Forgotten" count={stats?.forgotten} active={view === "forgotten"} onClick={() => setView("forgotten")} muted />
         </div>
         <div className="space-y-0.5">
@@ -181,7 +184,16 @@ function MemoryPanel() {
 
         {rows.length === 0 && (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {q ? `Nothing matches “${q}”.` : "Nothing here."}
+            {q
+              ? `Nothing matches “${q}”.`
+              : view === "unused"
+                // An empty delete-me list reads as broken unless it says why it
+                // is empty: pinned records are excluded (they are injected, never
+                // recalled, so their counter cannot move) and so is anything under
+                // a week old. This store was migrated on 9 Aug, so for now that is
+                // everything.
+                ? "Nothing here — pinned memories and anything written in the last 7 days are excluded, and this store was migrated on 9 Aug."
+                : "Nothing here."}
           </div>
         )}
 
