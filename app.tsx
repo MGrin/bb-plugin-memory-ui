@@ -196,6 +196,14 @@ function MemoryPanel() {
                 <span className={`truncate text-sm ${r.deleted ? "text-muted-foreground line-through" : "text-foreground"}`}>
                   {r.name}
                 </span>
+                {/* With ~1,000 project records across a dozen projects, "which
+                    project is this?" is the one piece of context the row cannot
+                    do without — but only when the list is not already scoped. */}
+                {!projectId && r.projectId && (
+                  <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {projName(r.projectId)}
+                  </span>
+                )}
                 <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
                   {r.deleted
                     ? `forgotten ${ago(r.deletedAt)}`
