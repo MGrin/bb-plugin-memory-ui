@@ -55,7 +55,9 @@ const MEM_DB = `${os.homedir()}/.bb/plugins/memory/data.db`;
 // the stale-but-working snapshot the better answer.
 const DB_RO = `file:${MEM_DB}?mode=ro`;
 const DB_STALE = `file:${MEM_DB}?immutable=1`;
-let dbUri = DB_RO;
+
+/** True while the last read had to use the stale snapshot; surfaced to the UI. */
+export let servingStale = false;
 
 const q1 = (s: string) => `'${s.replace(/'/g, "''")}'`;
 async function sq<T>(sql: string): Promise<T[]> {
@@ -63,13 +65,22 @@ async function sq<T>(sql: string): Promise<T[]> {
     (await run("/usr/bin/sqlite3", ["-json", uri, sql], { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 })).stdout;
   let stdout: string;
   try {
-    stdout = await exec(dbUri);
-  } catch (e) {
-    if (dbUri === DB_STALE) throw e;
-    // Fall back once, and stay fallen back — retrying a missing -shm on every
-    // query would double the process spawns on the slowest path.
-    dbUri = DB_STALE;
-    stdout = await exec(dbUri);
+    stdout = await exec(DB_RO);
+    servingStale = false;
+  } catch {
+    // PER CALL. The first version of this latched — "fall back once, and stay
+    // fallen back", to avoid re-spawning on a permanently missing -shm — and
+    // that turned one transient failure into permanent silent staleness. It
+    // happened within the hour: under load a single mode=ro spawn failed, the
+    // plugin pinned itself to the checkpointed snapshot, and every later read
+    // served ~20-minute-old data while mode=ro worked perfectly from the shell.
+    //
+    // Which is the exact bug this fallback was written to fix, reintroduced by
+    // the fix. A stale read reports no error and looks completely healthy, so
+    // it must never be something we opt into and forget. One wasted spawn on a
+    // genuinely broken database is the cheaper mistake.
+    stdout = await exec(DB_STALE);
+    servingStale = true;
   }
   return stdout.trim() ? (JSON.parse(stdout) as T[]) : [];
 }
@@ -135,6 +146,10 @@ export const rpcContract = defineRpcContract({
       standing: z.number(),
       unused: z.number(),
       forgotten: z.number(),
+      // Stale reads are invisible by construction — they return a complete,
+      // coherent, plausible store. If we ever have to serve one, say so rather
+      // than let the UI look healthy while showing yesterday.
+      stale: z.boolean(),
       projects: z.array(
         z.object({ projectId: z.string(), name: z.string(), count: z.number() }),
       ),
@@ -469,7 +484,7 @@ export default async function plugin(bb: BbPluginApi) {
         /* fall back to ids */
       }
       return {
-        active, global: glob, standing, unused, forgotten,
+        active, global: glob, standing, unused, forgotten, stale: servingStale,
         projects: counts.map((r) => ({
           projectId: r.project_id, name: names.get(r.project_id) ?? r.project_id, count: r.c,
         })),

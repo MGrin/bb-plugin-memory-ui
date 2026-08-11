@@ -27,6 +27,7 @@ type Detail = {
 };
 type Stats = {
   active: number; global: number; standing: number; unused: number; forgotten: number;
+  stale: boolean;
   projects: { projectId: string; name: string; count: number }[];
 };
 type Run = {
@@ -337,6 +338,13 @@ function MemoryPanel() {
               <option value="name">name</option>
             </select>
           </div>
+
+          {stats?.stale && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              Showing a stale snapshot — the store could not be opened WAL-aware, so recent writes are
+              missing. Nothing here is wrong, but some of it is old.
+            </div>
+          )}
 
           {err && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
