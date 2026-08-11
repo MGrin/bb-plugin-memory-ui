@@ -156,6 +156,43 @@ export const rpcContract = defineRpcContract({
       ),
     }),
   },
+  // CLUSTERS — structure across records, where every other view is per record.
+  //
+  // This started as a duplicate finder and the measurement killed that: over
+  // 1,501 real records only 2 pairs scored above 0.5 on combined name+summary
+  // similarity, while the name-similar band was dominated by deliberate SERIES
+  // ("VERDICT (1)" vs "VERDICT (3)", "stream B" vs "stream D") where a merge
+  // would destroy information. A list that is mostly false positives is worse
+  // than no list, because you stop reading it and then trust it.
+  //
+  // What the same data does support is narrower and much more useful: two
+  // records that say nearly the same sentence with a DIFFERENT NUMBER. That is
+  // not untidiness, it is the store contradicting itself, and whichever one an
+  // agent recalls first wins. Found in this store on the first run: a package
+  // pin recorded as both ^1.2.2 and ^1.2.3, and a claim marked "RETRACTED /
+  // FALSIFIED" living alongside the original claim it falsifies.
+  clusters: {
+    input: z.object({ limit: z.number().int().min(1).max(100).default(40) }).strict(),
+    output: z.object({
+      scanned: z.number(),
+      conflicts: z.array(
+        z.object({
+          overlap: z.number(),
+          a: z.object({ id: z.string(), name: z.string(), summary: z.string(), updatedAt: z.number().nullable() }),
+          b: z.object({ id: z.string(), name: z.string(), summary: z.string(), updatedAt: z.number().nullable() }),
+          aOnly: z.array(z.string()),
+          bOnly: z.array(z.string()),
+        }),
+      ),
+      families: z.array(
+        z.object({
+          prefix: z.string(),
+          count: z.number(),
+          members: z.array(z.object({ id: z.string(), name: z.string() })),
+        }),
+      ),
+    }),
+  },
   runChanges: {
     input: z
       .object({
@@ -442,6 +479,100 @@ export default async function plugin(bb: BbPluginApi) {
         forgotten: totals?.forgotten ?? 0,
         frontier: totals?.frontier ?? null,
         runs: page,
+      };
+    },
+
+    async clusters({ limit }) {
+      const rows = await sq<{ id: string; name: string; summary: string; updated_at: number | null }>(
+        `SELECT id, name, summary, updated_at FROM memories WHERE deleted_at IS NULL`,
+      );
+
+      const STOP = new Set(
+        "the a an of in on to is are and or for with by that this it as at from be was were not you your has have had its".split(" "),
+      );
+      const WORD = /[a-z][a-z0-9]{2,}/g;
+      // Versions and multi-digit numbers only. A bare "3" is in half the store
+      // and would make every pair look like a disagreement.
+      const VAL = /\^?\d+\.\d+(?:\.\d+)?|\b\d{2,}\b/g;
+      const words = (s: string) => new Set((s.toLowerCase().match(WORD) ?? []).filter((w) => !STOP.has(w)));
+      const vals = (s: string) => new Set(s.match(VAL) ?? []);
+
+      // Only records that carry a value can conflict over one, and a summary of
+      // four words has nothing to compare. Both filters shrink the pair space
+      // far more than they cost in recall.
+      const pool = rows
+        .map((r) => ({ r, w: words(r.summary), v: vals(r.summary) }))
+        .filter((x) => x.v.size > 0 && x.w.size >= 5);
+
+      const index = new Map<string, number[]>();
+      pool.forEach((x, i) => {
+        for (const w of x.w) {
+          const bucket = index.get(w);
+          if (bucket) bucket.push(i);
+          else index.set(w, [i]);
+        }
+      });
+
+      const seen = new Set<string>();
+      const conflicts: {
+        overlap: number; ai: number; bi: number; aOnly: string[]; bOnly: string[];
+      }[] = [];
+      for (const bucket of index.values()) {
+        // A word shared by 40+ records is a topic, not a coincidence, and pairing
+        // every combination of them is both quadratic and meaningless.
+        if (bucket.length > 40) continue;
+        for (let p = 0; p < bucket.length; p += 1) {
+          for (let q = p + 1; q < bucket.length; q += 1) {
+            const ai = bucket[p];
+            const bi = bucket[q];
+            const key = `${ai}:${bi}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const A = pool[ai];
+            const B = pool[bi];
+            let shared = 0;
+            for (const w of A.w) if (B.w.has(w)) shared += 1;
+            const overlap = shared / (A.w.size + B.w.size - shared);
+            if (overlap < 0.45) continue;
+            const aOnly = [...A.v].filter((v) => !B.v.has(v));
+            const bOnly = [...B.v].filter((v) => !A.v.has(v));
+            // One side merely carrying an extra id is not a disagreement; a
+            // disagreement needs each side to assert something the other does not.
+            if (aOnly.length === 0 || bOnly.length === 0) continue;
+            conflicts.push({ overlap: Math.round(overlap * 1000) / 1000, ai, bi, aOnly, bOnly });
+          }
+        }
+      }
+      conflicts.sort((x, y) => y.overlap - x.overlap);
+
+      // FAMILIES are a fact about the names, not a claim about meaning — which
+      // is exactly why they are safe to show where "duplicates" was not. Records
+      // are named as slugs and arrive in series, so a shared 4-token prefix is
+      // the store's real topology: "everything I know about flare-clients-qbo-tasks".
+      const fams = new Map<string, { id: string; name: string }[]>();
+      for (const r of rows) {
+        const parts = r.name.split("-").filter(Boolean);
+        if (parts.length < 4) continue;
+        const prefix = parts.slice(0, 4).join("-");
+        const bucket = fams.get(prefix);
+        if (bucket) bucket.push({ id: r.id, name: r.name });
+        else fams.set(prefix, [{ id: r.id, name: r.name }]);
+      }
+      const families = [...fams.entries()]
+        .filter(([, m]) => m.length >= 4)
+        .sort((a, b) => b[1].length - a[1].length)
+        .slice(0, 30)
+        .map(([prefix, m]) => ({ prefix, count: m.length, members: m.slice(0, 40) }));
+
+      const view = (i: number) => ({
+        id: pool[i].r.id, name: pool[i].r.name, summary: pool[i].r.summary, updatedAt: pool[i].r.updated_at,
+      });
+      return {
+        scanned: rows.length,
+        conflicts: conflicts.slice(0, limit).map((c) => ({
+          overlap: c.overlap, a: view(c.ai), b: view(c.bi), aOnly: c.aOnly.slice(0, 4), bOnly: c.bOnly.slice(0, 4),
+        })),
+        families,
       };
     },
 

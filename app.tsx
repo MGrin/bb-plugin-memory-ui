@@ -35,6 +35,14 @@ type Run = {
   queueFrom: number | null; queueTo: number | null;
 };
 type Sweep = { active: number; touched: number; forgotten: number; frontier: number | null; runs: Run[] };
+type Conflict = {
+  overlap: number;
+  a: { id: string; name: string; summary: string; updatedAt: number | null };
+  b: { id: string; name: string; summary: string; updatedAt: number | null };
+  aOnly: string[]; bOnly: string[];
+};
+type Family = { prefix: string; count: number; members: { id: string; name: string }[] };
+type Clusters = { scanned: number; conflicts: Conflict[]; families: Family[] };
 type Change = { memoryId: string; name: string; action: string; at: number; reason: string; deleted: boolean };
 type View = "active" | "standing" | "unused" | "forgotten";
 type Sort = "recent" | "used" | "name";
@@ -99,7 +107,7 @@ function SideItem(props: { label: string; count?: number; active: boolean; onCli
 
 function MemoryPanel() {
   const rpc = useRpc<typeof rpcContract>();
-  const [mode, setMode] = useState<"list" | "sweep">("list");
+  const [mode, setMode] = useState<"list" | "sweep" | "clusters">("list");
   const [rows, setRows] = useState<Row[]>([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -209,6 +217,7 @@ function MemoryPanel() {
         <div className="space-y-0.5">
           <div className="px-2 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">Curation</div>
           <SideItem label="Sweep" active={mode === "sweep"} onClick={() => { setMode("sweep"); setSel(null); }} />
+          <SideItem label="Conflicts" active={mode === "clusters"} onClick={() => { setMode("clusters"); setSel(null); }} />
         </div>
         <div className="space-y-0.5">
           <div className="px-2 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">Scope</div>
@@ -223,6 +232,8 @@ function MemoryPanel() {
 
       {mode === "sweep" ? (
         <SweepView onOpen={open} />
+      ) : mode === "clusters" ? (
+        <ClustersView onOpen={open} />
       ) : (
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
           <div className="flex items-center gap-2">
@@ -489,6 +500,135 @@ function SweepView({ onOpen }: { onOpen: (id: string) => void }) {
       <div className="pt-1 text-[11px] text-muted-foreground opacity-70">
         Deletions the nightly cap refused are not shown here — they were never written, so no record of
         them exists in the store. The curation run's own report has them.
+      </div>
+    </div>
+  );
+}
+
+// CONFLICTS — where the store disagrees with itself.
+//
+// The cut at 0.55 is doing real work and is worth stating: on this store the two
+// pairs above it are genuine contradictions (a package pin recorded as both
+// ^1.2.2 and ^1.2.3; a claim marked RETRACTED living beside the claim it
+// falsifies) and the two below it are SERIES — different deployments announced
+// in the same words. Same detector, opposite meaning, so the weaker band is
+// shown on request rather than mixed in.
+const STRONG = 0.55;
+
+function ValueChip({ v, tone }: { v: string; tone: "a" | "b" }) {
+  return (
+    <span className={`rounded px-1 py-0.5 font-mono text-[10px] ${
+      tone === "a" ? "bg-primary/15 text-primary" : "bg-destructive/15 text-destructive"
+    }`}>{v}</span>
+  );
+}
+
+function ClustersView({ onOpen }: { onOpen: (id: string) => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [data, setData] = useState<Clusters | null>(null);
+  const [weak, setWeak] = useState(false);
+  const [openFam, setOpenFam] = useState<string | null>(null);
+
+  const reload = useCallback(async () => setData((await rpc.call("clusters", { limit: 40 })) as Clusters), []);
+  useEffect(() => { void reload(); }, [reload]);
+  useRealtime("memory-ui.changed", () => { void reload(); });
+
+  const all = data?.conflicts ?? [];
+  const strong = all.filter((c) => c.overlap >= STRONG);
+  const shown = weak ? all : strong;
+
+  return (
+    <div className="flex-1 overflow-y-auto p-3 space-y-4">
+      <div>
+        <div className="flex items-center gap-2">
+          <div className="text-sm font-medium text-foreground">Conflicts</div>
+          {all.length > strong.length && (
+            <button onClick={() => setWeak(!weak)} className="ml-auto text-xs text-muted-foreground underline decoration-dotted">
+              {weak ? "strong matches only" : `+ ${all.length - strong.length} weaker match${all.length - strong.length > 1 ? "es" : ""}`}
+            </button>
+          )}
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          Two records saying nearly the same sentence with a <strong>different number</strong> — a version, an
+          id, a date. Whichever one an agent recalls first wins, so this is the store contradicting itself
+          rather than merely repeating itself.
+        </div>
+      </div>
+
+      {data && shown.length === 0 && (
+        <div className="rounded-md border border-border bg-card px-3 py-6 text-center text-sm text-muted-foreground">
+          No numeric disagreements across {data.scanned.toLocaleString()} records.
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {shown.map((c) => (
+          <div key={`${c.a.id}:${c.b.id}`} className="rounded-md border border-border bg-card p-3 space-y-2">
+            <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <span>{Math.round(c.overlap * 100)}% of the wording is shared</span>
+              {c.overlap < STRONG && (
+                <span className="rounded bg-muted px-1.5 py-0.5">weaker — often a series, not a conflict</span>
+              )}
+              <span className="ml-auto flex items-center gap-1">
+                {c.aOnly.map((v) => <ValueChip key={v} v={v} tone="a" />)}
+                <span className="opacity-50">vs</span>
+                {c.bOnly.map((v) => <ValueChip key={v} v={v} tone="b" />)}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {[c.a, c.b].map((side, i) => (
+                <button key={side.id} onClick={() => onOpen(side.id)}
+                  className={`rounded-md border p-2 text-left hover:bg-accent ${
+                    i === 0 ? "border-primary/40" : "border-destructive/40"
+                  }`}>
+                  <div className="truncate text-xs text-foreground">{side.name}</div>
+                  <div className="mt-0.5 line-clamp-4 text-[11px] text-muted-foreground">{side.summary}</div>
+                  <div className="mt-1 text-[10px] text-muted-foreground opacity-70">updated {ago(side.updatedAt)}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div>
+        <div className="text-sm font-medium text-foreground">Families</div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          Records are named as slugs and arrive in series, so a shared name prefix is the store's real
+          topology — everything it knows about one subject. This is a fact about the names, not a claim
+          that any two of these say the same thing.
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        {data?.families.map((f) => (
+          <div key={f.prefix} className="rounded-md border border-border bg-card">
+            <button onClick={() => setOpenFam(openFam === f.prefix ? null : f.prefix)}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent/50">
+              <span className="truncate font-mono text-xs text-foreground">{f.prefix}</span>
+              <span className="ml-auto shrink-0 tabular-nums text-xs text-muted-foreground">{f.count}</span>
+            </button>
+            {openFam === f.prefix && (
+              <div className="border-t border-border px-3 py-2 space-y-0.5">
+                {f.members.map((m) => (
+                  <button key={m.id} onClick={() => onOpen(m.id)}
+                    className="block w-full truncate text-left text-xs text-muted-foreground hover:text-foreground hover:underline">
+                    {m.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* The limit, said out loud. This detector compares NUMBERS; two records
+          that contradict each other in words alone ("DEAD" versus
+          "operator-approved") share no differing value and will not appear.
+          Leaving that unsaid would make an empty list read as "no contradictions". */}
+      <div className="pt-1 text-[11px] text-muted-foreground opacity-70">
+        Only numeric disagreements are detectable here. Two records that contradict each other in words
+        alone will not show up — that judgement is the nightly curation's job.
       </div>
     </div>
   );

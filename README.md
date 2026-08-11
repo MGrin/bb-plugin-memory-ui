@@ -24,6 +24,9 @@ throw away (**Forgotten**, with one-click restore).
 is the view that makes it accountable: every run, who ran it, what it rewrote, what it
 merged away and into which record, and how far it has advanced through the backlog.
 
+**Conflicts** — where the store disagrees with itself, plus the family structure of what it
+knows.
+
 **Homepage section** — your standing instructions, the records a curation pass may tighten
 but must never drop.
 
@@ -53,6 +56,36 @@ only if you already suspect something happened. Sweep reads it across records:
 The header count says *rewritten*, not *curated*, on purpose: a bulk backfill lands in that
 number identically to a nightly curation and the store cannot tell them apart. Attribution
 is the run list's job.
+
+## Conflicts, and the duplicate finder that isn't there
+
+This view started as a near-duplicate finder, and measuring killed that idea. Over 1,501
+real records, only **two pairs** scored above 0.5 on combined name+summary similarity —
+while the name-similar band was dominated by deliberate *series*: `VERDICT (1)` beside
+`VERDICT (3)`, `stream B` beside `stream D`. Merging those destroys information. A list
+that is mostly false positives is worse than no list, because you stop reading it and then
+keep trusting it.
+
+What the same data does support is narrower and far more useful: **two records saying
+nearly the same sentence with a different number.** That is not untidiness, it is the store
+contradicting itself, and whichever record an agent recalls first wins. On the first run
+against a real store it found a package pin recorded as both `^1.2.2` and `^1.2.3`, and a
+claim marked `RETRACTED / FALSIFIED` living alongside the original claim it falsifies —
+both still active, both still recallable.
+
+The 55%-shared-wording cut is doing real work: above it were those two genuine
+contradictions, below it were two *series* — different deployments announced in the same
+words. Same detector, opposite meaning, so the weaker band is shown on request rather than
+mixed in.
+
+**Families** group records by shared name prefix. Records are named as slugs and arrive in
+series, so a prefix is the store's real topology — everything it knows about one subject.
+Unlike "duplicates", a family is a fact about the names rather than a claim about meaning,
+which is what makes it safe to show.
+
+The detector compares **numbers**. Two records that contradict each other in words alone
+("DEAD" versus "operator-approved") share no differing value and will not appear — the view
+says so, because otherwise an empty list reads as "no contradictions".
 
 ## Why reasons are required
 
