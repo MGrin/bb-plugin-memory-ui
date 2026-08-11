@@ -112,6 +112,10 @@ function MemoryPanel() {
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
   const [q, setQ] = useState("");
+  // What the box shows vs what we query. Typing "sandbox" used to fire seven
+  // full-text queries, each spawning its own process, and the six doomed ones
+  // competed for the machine with the only one whose answer would be used.
+  const [qLive, setQLive] = useState("");
   const [view, setView] = useState<View>("active");
   const [sort, setSort] = useState<Sort>("recent");
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -119,27 +123,88 @@ function MemoryPanel() {
   const [offset, setOffset] = useState(0);
   const [cursor, setCursor] = useState(0);
   const [sel, setSel] = useState<Detail | null>(null);
+  // The id we are WAITING for, kept apart from the record we HAVE. Without this
+  // split, clicking B while A is still in flight leaves A's body on screen under
+  // no indication at all — and if A's response lands after B's, A wins and stays.
+  const [pendingId, setPendingId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
+  // Every async read is stamped and checked on arrival. RPCs here are not
+  // instant — this store is read by spawning a process per query on a machine
+  // that routinely sits at load 40+ — so responses genuinely do arrive out of
+  // order, and the last one to LAND was winning rather than the last one asked
+  // for. That is the whole "I clicked somewhere else and still see the old
+  // thing" bug, and it gets worse the faster you click, which is exactly
+  // backwards from what a user expects.
+  const listSeq = useRef(0);
+  const detailSeq = useRef(0);
+
   const load = useCallback(
     async (off = offset) => {
-      const r = await rpc.call("list", { scope, projectId, q, view, sort, limit: PAGE, offset: off });
-      setRows(r.rows as Row[]);
-      setTotal(r.total);
-      setCursor((c) => Math.min(c, Math.max(0, (r.rows as Row[]).length - 1)));
+      const seq = ++listSeq.current;
+      setLoading(true);
+      try {
+        const r = await rpc.call("list", { scope, projectId, q: qLive, view, sort, limit: PAGE, offset: off });
+        if (seq !== listSeq.current) return; // a newer query is already in flight
+        setRows(r.rows as Row[]);
+        setTotal(r.total);
+        setErr(null);
+        setCursor((c) => Math.min(c, Math.max(0, (r.rows as Row[]).length - 1)));
+      } catch {
+        // An empty list and a failed list look identical, and the empty one is
+        // far more believable. Say which it was.
+        if (seq === listSeq.current) setErr("Could not read the memory store.");
+      } finally {
+        if (seq === listSeq.current) setLoading(false);
+      }
     },
-    [scope, projectId, q, view, sort, offset],
+    [scope, projectId, qLive, view, sort, offset],
   );
-  const refreshStats = useCallback(async () => setStats((await rpc.call("stats", null)) as Stats), []);
+  // Retried, because ONE transient failure used to cost the sidebar permanently.
+  // Observed 2026-08-11: the panel was opened ~2s after a plugin reload, the
+  // single mount-time stats call failed, and every count and the whole project
+  // list stayed blank for the life of the page — with no error anywhere, so it
+  // read as "this store has no projects". bb's plugin-contributions probe is
+  // known to time out under load (get-bb/bb#1313) and this machine sits at load
+  // 35+, so this is the normal case, not the unlucky one.
+  const refreshStats = useCallback(async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        setStats((await rpc.call("stats", null)) as Stats);
+        setErr(null);
+        return;
+      } catch {
+        await new Promise((r) => window.setTimeout(r, 400 * (attempt + 1)));
+      }
+    }
+    setErr("Could not read the memory store — counts may be stale.");
+  }, []);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setQLive(q), 250);
+    return () => window.clearTimeout(t);
+  }, [q]);
 
   useEffect(() => { void refreshStats(); }, []);
-  useEffect(() => { if (mode === "list") { setOffset(0); void load(0); } }, [q, view, sort, scope, projectId, mode]);
+  useEffect(() => { if (mode === "list") { setOffset(0); void load(0); } }, [qLive, view, sort, scope, projectId, mode]);
   useRealtime("memory-ui.changed", () => { if (mode === "list") void load(); void refreshStats(); });
 
-  const open = useCallback(async (id: string) => setSel((await rpc.call("get", { id })) as Detail), []);
+  const open = useCallback(async (id: string) => {
+    const seq = ++detailSeq.current;
+    setPendingId(id);
+    const d = (await rpc.call("get", { id })) as Detail;
+    if (seq !== detailSeq.current) return; // something else was clicked since
+    setSel(d);
+    setPendingId(null);
+  }, []);
   const say = (m: string) => { setToast(m); window.setTimeout(() => setToast(null), 4000); };
+  // Closing must also cancel what is in flight. Otherwise a record opened and
+  // dismissed before its response lands pops back open on arrival.
+  const close = useCallback(() => { detailSeq.current += 1; setSel(null); setPendingId(null); }, []);
   const goList = (v: View) => { setMode("list"); setView(v); };
 
   // Keyboard: 1,500 records is too many to mouse through. j/k move, Enter opens,
@@ -148,7 +213,7 @@ function MemoryPanel() {
     const onKey = (e: KeyboardEvent) => {
       const typing = document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA";
       if (e.key === "/" && !typing) { e.preventDefault(); searchRef.current?.focus(); return; }
-      if (e.key === "Escape") { if (typing) (document.activeElement as HTMLElement).blur(); else setSel(null); return; }
+      if (e.key === "Escape") { if (typing) (document.activeElement as HTMLElement).blur(); else close(); return; }
       if (typing || mode !== "list") return;
       if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); setCursor((c) => Math.min(c + 1, rows.length - 1)); }
       if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); setCursor((c) => Math.max(c - 1, 0)); }
@@ -156,7 +221,7 @@ function MemoryPanel() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [rows, cursor, open, mode]);
+  }, [rows, cursor, open, mode, close]);
 
   const act = async (op: Op, row: Row, extra?: { summary?: string; details?: string; kind?: string }) => {
     setBusy(true);
@@ -248,6 +313,12 @@ function MemoryPanel() {
             </select>
           </div>
 
+          {err && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {err} <button onClick={() => { void load(); void refreshStats(); }} className="underline">Retry</button>
+            </div>
+          )}
+
           {view === "forgotten" && (
             <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
               Soft-deleted records, newest first — including everything the nightly curation removed.
@@ -274,7 +345,11 @@ function MemoryPanel() {
             </div>
           )}
 
-          <div className="space-y-1">
+          {/* Dim rather than blank. Replacing the list with a spinner throws away
+              the thing you were reading and makes every query feel like a page
+              load; dimming says "this is the previous answer, a new one is
+              coming" without lying about either. */}
+          <div className={`space-y-1 transition-opacity ${loading ? "opacity-50" : ""}`}>
             {rows.map((r, i) => (
               <button key={r.id} onClick={() => { setCursor(i); void open(r.id); }}
                 className={`block w-full rounded-md border px-3 py-2 text-left hover:bg-accent ${
@@ -316,6 +391,7 @@ function MemoryPanel() {
             <button disabled={offset === 0} onClick={() => { const o = Math.max(0, offset - PAGE); setOffset(o); void load(o); }}
               className="rounded border border-border px-2 py-1 disabled:opacity-40">← prev</button>
             <span>{total === 0 ? 0 : offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+            {loading && <span className="opacity-60">loading…</span>}
             <button disabled={offset + PAGE >= total} onClick={() => { const o = offset + PAGE; setOffset(o); void load(o); }}
               className="rounded border border-border px-2 py-1 disabled:opacity-40">next →</button>
             <span className="ml-auto opacity-60">j/k move · enter open · / search · esc close</span>
@@ -323,10 +399,24 @@ function MemoryPanel() {
         </div>
       )}
 
-      {sel?.row && (
+      {/* Pending wins over stale. While a record is loading we show ITS name —
+          which we already have from the row that was clicked — over an empty
+          body, instead of the previous record's contents. Showing the old body
+          under a new selection is not "slow", it is wrong, and it is
+          indistinguishable from having loaded correctly. */}
+      {pendingId ? (
+        <div className="w-[400px] shrink-0 overflow-y-auto border-l border-border bg-card p-4 space-y-3">
+          <div className="truncate text-sm font-medium text-foreground">
+            {rows.find((r) => r.id === pendingId)?.name ?? pendingId}
+          </div>
+          <div className="text-xs text-muted-foreground">loading…</div>
+          <div className="h-24 animate-pulse rounded-md bg-muted/60" />
+          <div className="h-40 animate-pulse rounded-md bg-muted/40" />
+        </div>
+      ) : sel?.row ? (
         <DetailPane sel={sel} busy={busy} projectLabel={projName(sel.row.projectId)}
-          onClose={() => setSel(null)} onAct={act} onOpen={open} />
-      )}
+          onClose={close} onAct={act} onOpen={open} />
+      ) : null}
 
       {toast && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 rounded-md border border-border bg-card px-3 py-2 text-sm shadow-lg">
@@ -346,17 +436,30 @@ function SweepView({ onOpen }: { onOpen: (id: string) => void }) {
   const [changes, setChanges] = useState<{ rows: Change[]; total: number } | null>(null);
   const [showAll, setShowAll] = useState(false);
 
-  const reload = useCallback(async () => setData((await rpc.call("sweep", { days })) as Sweep), [days]);
+  // Same stamping as the list. A realtime "memory-ui.changed" while a reload is
+  // already in flight put two sweeps in the air, and the slower one overwrote
+  // the fresher answer.
+  const seq = useRef(0);
+  const changeSeq = useRef(0);
+  const reload = useCallback(async () => {
+    const s = ++seq.current;
+    const d = (await rpc.call("sweep", { days })) as Sweep;
+    if (s === seq.current) setData(d);
+  }, [days]);
   useEffect(() => { void reload(); }, [reload]);
   useRealtime("memory-ui.changed", () => { void reload(); });
 
   const expand = async (run: Run) => {
-    if (openRun === run.key) { setOpenRun(null); setChanges(null); return; }
+    if (openRun === run.key) { changeSeq.current += 1; setOpenRun(null); setChanges(null); return; }
+    const s = ++changeSeq.current;
     setOpenRun(run.key);
     setChanges(null);
     const r = (await rpc.call("runChanges", {
       threadId: run.threadId, from: run.startedAt, to: run.endedAt, limit: 200,
     })) as { changes: Change[]; total: number };
+    // Expanding a second run before the first responded used to drop the first
+    // run's changes into the second run's open panel.
+    if (s !== changeSeq.current) return;
     setChanges({ rows: r.changes, total: r.total });
   };
 
@@ -529,7 +632,12 @@ function ClustersView({ onOpen }: { onOpen: (id: string) => void }) {
   const [weak, setWeak] = useState(false);
   const [openFam, setOpenFam] = useState<string | null>(null);
 
-  const reload = useCallback(async () => setData((await rpc.call("clusters", { limit: 40 })) as Clusters), []);
+  const seq = useRef(0);
+  const reload = useCallback(async () => {
+    const s = ++seq.current;
+    const d = (await rpc.call("clusters", { limit: 40 })) as Clusters;
+    if (s === seq.current) setData(d);
+  }, []);
   useEffect(() => { void reload(); }, [reload]);
   useRealtime("memory-ui.changed", () => { void reload(); });
 

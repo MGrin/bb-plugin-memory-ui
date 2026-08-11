@@ -38,12 +38,39 @@ import { z } from "zod";
 const run = promisify(execFile);
 const MEM_DB = `${os.homedir()}/.bb/plugins/memory/data.db`;
 
+// NOT `immutable=1`. That flag promises SQLite the file can never change, and in
+// exchange SQLite skips the -wal file entirely — so on a WAL database (which
+// this one is) every read returns the last CHECKPOINTED state and silently
+// ignores everything written since.
+//
+// Measured 2026-08-11: data.db checkpointed at 12:58 with a 4.4 MB -wal on top
+// of it. immutable=1 counted 1,501 active records; the truth was 1,507. Three
+// records forgotten and one added minutes earlier were still listed as present,
+// and no error was raised anywhere — the UI simply showed a coherent, plausible,
+// 45-minute-old store. That is the worst failure mode a read path can have.
+//
+// `mode=ro` is WAL-aware and still cannot write. The one thing it cannot do is
+// CREATE the -shm file when none exists (a read-only connection may not), so if
+// the database has never been opened by a writer this fails — and only then is
+// the stale-but-working snapshot the better answer.
+const DB_RO = `file:${MEM_DB}?mode=ro`;
+const DB_STALE = `file:${MEM_DB}?immutable=1`;
+let dbUri = DB_RO;
+
 const q1 = (s: string) => `'${s.replace(/'/g, "''")}'`;
 async function sq<T>(sql: string): Promise<T[]> {
-  const { stdout } = await run("/usr/bin/sqlite3", ["-json", `file:${MEM_DB}?immutable=1`, sql], {
-    timeout: 15_000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  const exec = async (uri: string) =>
+    (await run("/usr/bin/sqlite3", ["-json", uri, sql], { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 })).stdout;
+  let stdout: string;
+  try {
+    stdout = await exec(dbUri);
+  } catch (e) {
+    if (dbUri === DB_STALE) throw e;
+    // Fall back once, and stay fallen back — retrying a missing -shm on every
+    // query would double the process spawns on the slowest path.
+    dbUri = DB_STALE;
+    stdout = await exec(dbUri);
+  }
   return stdout.trim() ? (JSON.parse(stdout) as T[]) : [];
 }
 
@@ -289,6 +316,8 @@ async function bbMemory(args: string[], projectId: string | null) {
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  const titleCache = new Map<string, string | null>();
+
   const viewClause = (view: string) =>
     view === "forgotten"
       ? "m.deleted_at IS NOT NULL"
@@ -338,40 +367,76 @@ export default async function plugin(bb: BbPluginApi) {
             : input.view === "forgotten"
               ? "m.deleted_at DESC"
               : "m.updated_at DESC";
-      const totalRows = await sq<{ c: number }>(`SELECT COUNT(*) c FROM ${from} ${w}`);
-      const rows = await sq<MemRow>(
-        `SELECT m.* FROM ${from} ${w} ORDER BY ${order} LIMIT ${input.limit} OFFSET ${input.offset}`,
+      // COUNT(*) OVER () rides along with the page instead of costing a second
+      // process. SQLite evaluates window functions before LIMIT, so this is the
+      // full filtered count, not the size of the page.
+      const rows = await sq<MemRow & { total_count: number }>(
+        `SELECT m.*, COUNT(*) OVER () total_count FROM ${from} ${w}
+         ORDER BY ${order} LIMIT ${input.limit} OFFSET ${input.offset}`,
       );
-      return { rows: rows.map(toRow), total: totalRows[0]?.c ?? 0 };
+      // An empty page carries no window value at all. That only happens past the
+      // end of the list, so ask for the count directly rather than reporting 0
+      // and making the pager claim the store is empty.
+      if (rows.length === 0) {
+        const only = await sq<{ c: number }>(`SELECT COUNT(*) c FROM ${from} ${w}`);
+        return { rows: [], total: only[0]?.c ?? 0 };
+      }
+      return { rows: rows.map(toRow), total: rows[0].total_count };
     },
 
+    // One process, record and history together. This is the click path — it runs
+    // every time a row is opened — so a second spawn here is the one the human
+    // actually waits on.
     async get({ id }) {
-      const rs = await sq<MemRow & { details: string | null; write_reason: string | null }>(
-        `SELECT * FROM memories WHERE id = ${q1(id)}`,
+      const rs = await sq<
+        MemRow & { details: string | null; write_reason: string | null; history_json: string | null }
+      >(
+        `SELECT m.*, (
+            SELECT json_group_array(json_object('version', version, 'at', created_at, 'reason', write_reason))
+            FROM (SELECT version, created_at, write_reason FROM memory_history
+                  WHERE memory_id = ${q1(id)} ORDER BY version DESC LIMIT 20)
+         ) history_json
+         FROM memories m WHERE m.id = ${q1(id)}`,
       );
       const r = rs[0];
       if (!r) return { row: null, details: null, writeReason: null, history: [] };
-      const history = await sq<{ version: number; at: number | null; reason: string | null }>(
-        `SELECT version, created_at at, write_reason reason FROM memory_history
-         WHERE memory_id = ${q1(id)} ORDER BY version DESC LIMIT 20`,
-      );
+      let history: { version: number; at: number | null; reason: string | null }[] = [];
+      try {
+        history = JSON.parse(r.history_json ?? "[]");
+      } catch {
+        history = [];
+      }
       return { row: toRow(r), details: r.details, writeReason: r.write_reason, history };
     },
 
     async stats() {
-      const one = async (sql: string) => (await sq<{ c: number }>(sql))[0]?.c ?? 0;
-      // Every count comes from viewClause, the same predicate the list uses.
-      // They were separate copies until 2026-08-10, so tightening the "never
-      // used" rule would have left the sidebar badge showing the old number —
-      // a count that disagrees with the list it labels is worse than no count.
-      const countOf = (view: string) => one(`SELECT COUNT(*) c FROM memories m WHERE ${viewClause(view)}`);
-      const [active, glob, standing, unused, forgotten] = await Promise.all([
-        countOf("active"),
-        one("SELECT COUNT(*) c FROM memories m WHERE m.deleted_at IS NULL AND m.scope='global'"),
-        countOf("standing"),
-        countOf("unused"),
-        countOf("forgotten"),
-      ]);
+      // ONE process, not six. Every sq() call spawns /usr/bin/sqlite3, and the
+      // spawn — not the query — is the cost: measured 2026-08-11 at ~39ms each
+      // idle, but this machine routinely sits at load 40+ running real work, and
+      // under that the same six spawns took 1.9s while the queries themselves
+      // stayed in single-digit milliseconds. Scalar subqueries collapse them all
+      // into one row from one process.
+      //
+      // Every count still comes from viewClause, the same predicate the list
+      // uses. They were separate copies until 2026-08-10, so tightening the
+      // "never used" rule would have left the sidebar badge showing the old
+      // number — a count that disagrees with the list it labels is worse than
+      // no count at all.
+      const counted = (
+        await sq<{ active: number; global: number; standing: number; unused: number; forgotten: number }>(
+          `SELECT
+             (SELECT COUNT(*) FROM memories m WHERE ${viewClause("active")}) active,
+             (SELECT COUNT(*) FROM memories m WHERE m.deleted_at IS NULL AND m.scope='global') global,
+             (SELECT COUNT(*) FROM memories m WHERE ${viewClause("standing")}) standing,
+             (SELECT COUNT(*) FROM memories m WHERE ${viewClause("unused")}) unused,
+             (SELECT COUNT(*) FROM memories m WHERE ${viewClause("forgotten")}) forgotten`,
+        )
+      )[0];
+      const active = counted?.active ?? 0;
+      const glob = counted?.global ?? 0;
+      const standing = counted?.standing ?? 0;
+      const unused = counted?.unused ?? 0;
+      const forgotten = counted?.forgotten ?? 0;
       const counts = await sq<{ project_id: string; c: number }>(
         `SELECT project_id, COUNT(*) c FROM memories
          WHERE deleted_at IS NULL AND project_id IS NOT NULL GROUP BY project_id ORDER BY c DESC`,
@@ -461,15 +526,33 @@ export default async function plugin(bb: BbPluginApi) {
       // versus `thr_ndhunrpsek`. Best effort per run: a thread can be archived or
       // deleted while its writes remain, and one missing title must not blank the
       // whole view.
+      // Cached across calls. Without this, opening Sweep fired up to 60 internal
+      // threads.get calls EVERY time — on a machine at load 40+ that alone was
+      // most of the view's latency, to re-fetch titles that essentially never
+      // change. A missing title is cached as null too, so a deleted thread costs
+      // one lookup rather than one per render.
       await Promise.all(
         page.map(async (r) => {
           if (!r.threadId) return;
+          if (titleCache.has(r.threadId)) {
+            r.title = titleCache.get(r.threadId) ?? null;
+            return;
+          }
           try {
-            const t = (await bb.sdk.threads.get({ threadId: r.threadId })) as { title?: string | null };
+            // Bounded. Of 38 distinct threads in a 14-day window only 19 still
+            // exist, and looking up the missing ones is what made the first load
+            // of this view take 29 SECONDS — they do not fail fast. A title is a
+            // nicety; the run and its counts are the content, and they are
+            // already in hand. So each lookup gets 1.5s and then we move on.
+            const t = (await Promise.race([
+              bb.sdk.threads.get({ threadId: r.threadId }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 1500)),
+            ])) as { title?: string | null };
             r.title = t?.title ?? null;
           } catch {
             r.title = null;
           }
+          titleCache.set(r.threadId, r.title);
         }),
       );
 
