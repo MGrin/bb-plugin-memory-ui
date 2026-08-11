@@ -1,17 +1,23 @@
-// bb-plugin-memory-ui frontend — Memory panel + pinned homepage section.
+// bb-plugin-memory-ui frontend — Memory panel (browse + curate) and Sweep
+// (what has been rewriting the store).
 //
-// Designed against the store's real shape: ~1,400 records, one kind, importance
-// mostly meaningless, 80% sharing one tag, and most never read. So the list
-// shows identity + usage and nothing else, navigation is a keyboard away, and
-// the views answer questions ("what is dead weight?", "what did an agent throw
-// away?") instead of exposing schema fields.
+// Designed against the store's real shape: ~1,500 records, importance mostly
+// meaningless, most never recalled. So the list shows identity + usage and
+// nothing else, navigation is a keyboard away, and the views answer questions
+// ("what must survive curation?", "what is dead weight?", "what did an agent
+// throw away?") instead of exposing schema fields.
+//
+// Sweep exists because the honest answer to "why would I ever open this?" was
+// not browsing — a store you only read through search does not need a browser.
+// It is that an agent rewrites and deletes records here every night, and until
+// now the only trace was a per-record history you had to already suspect.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 type Row = {
   id: string; scope: string; projectId: string | null; name: string; summary: string;
-  tags: string[]; importance: number | null; pinned: boolean; version: number;
+  kind: string; tags: string[]; importance: number | null; version: number;
   updatedAt: number | null; accessCount: number; lastAccessedAt: number | null;
   deleted: boolean; deletedAt: number | null;
 };
@@ -20,13 +26,23 @@ type Detail = {
   history: { version: number; at: number | null; reason: string | null }[];
 };
 type Stats = {
-  active: number; global: number; pinned: number; unused: number; forgotten: number;
+  active: number; global: number; standing: number; unused: number; forgotten: number;
   projects: { projectId: string; name: string; count: number }[];
 };
-type View = "active" | "pinned" | "unused" | "forgotten";
+type Run = {
+  key: string; threadId: string | null; title: string | null;
+  startedAt: number; endedAt: number; creates: number; updates: number; forgets: number;
+  queueFrom: number | null; queueTo: number | null;
+};
+type Sweep = { active: number; touched: number; forgotten: number; frontier: number | null; runs: Run[] };
+type Change = { memoryId: string; name: string; action: string; at: number; reason: string; deleted: boolean };
+type View = "active" | "standing" | "unused" | "forgotten";
 type Sort = "recent" | "used" | "name";
+type Op = "save" | "kind" | "forget" | "restore";
 
 const PAGE = 50;
+// The memory plugin rejects anything else, so the dropdown offers exactly this.
+const KINDS = ["fact", "preference", "decision", "procedure", "episode", "reference"] as const;
 
 /** "3d ago" beats an ISO timestamp when scanning a list. */
 function ago(ms: number | null): string {
@@ -36,6 +52,33 @@ function ago(ms: number | null): string {
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   if (s < 2592000) return `${Math.round(s / 86400)}d ago`;
   return `${Math.round(s / 2592000)}mo ago`;
+}
+const day = (ms: number | null) =>
+  ms ? new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—";
+const clock = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+// Curation reasons name the record that kept the fact — "Near-duplicate of
+// mem_thvu4qqt9ko" — which is the single most useful thing in a merge and was,
+// as plain text, the single most annoying: the only way to see what survived was
+// to copy the id into search. Linkified, a merge is one click to verify.
+const MEM_ID = /\bmem_[A-Za-z0-9_-]{6,}\b/g;
+function Reason({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
+  const out: React.ReactNode[] = [];
+  let last = 0;
+  for (const m of text.matchAll(MEM_ID)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push(text.slice(last, at));
+    out.push(
+      <button key={`${at}`} onClick={(e) => { e.stopPropagation(); onOpen(m[0]); }}
+        className="underline decoration-dotted underline-offset-2 hover:text-foreground">
+        {m[0]}
+      </button>,
+    );
+    last = at + m[0].length;
+  }
+  out.push(text.slice(last));
+  return <>{out}</>;
 }
 
 function SideItem(props: { label: string; count?: number; active: boolean; onClick: () => void; muted?: boolean }) {
@@ -56,6 +99,7 @@ function SideItem(props: { label: string; count?: number; active: boolean; onCli
 
 function MemoryPanel() {
   const rpc = useRpc<typeof rpcContract>();
+  const [mode, setMode] = useState<"list" | "sweep">("list");
   const [rows, setRows] = useState<Row[]>([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -83,48 +127,51 @@ function MemoryPanel() {
   const refreshStats = useCallback(async () => setStats((await rpc.call("stats", null)) as Stats), []);
 
   useEffect(() => { void refreshStats(); }, []);
-  useEffect(() => { setOffset(0); void load(0); }, [q, view, sort, scope, projectId]);
-  useRealtime("memory-ui.changed", () => { void load(); void refreshStats(); });
+  useEffect(() => { if (mode === "list") { setOffset(0); void load(0); } }, [q, view, sort, scope, projectId, mode]);
+  useRealtime("memory-ui.changed", () => { if (mode === "list") void load(); void refreshStats(); });
 
   const open = useCallback(async (id: string) => setSel((await rpc.call("get", { id })) as Detail), []);
   const say = (m: string) => { setToast(m); window.setTimeout(() => setToast(null), 4000); };
+  const goList = (v: View) => { setMode("list"); setView(v); };
 
-  // Keyboard: 1,400 records is too many to mouse through. j/k move, Enter opens,
+  // Keyboard: 1,500 records is too many to mouse through. j/k move, Enter opens,
   // / focuses search, Esc closes — the bindings a list like this should have.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const typing = document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA";
       if (e.key === "/" && !typing) { e.preventDefault(); searchRef.current?.focus(); return; }
       if (e.key === "Escape") { if (typing) (document.activeElement as HTMLElement).blur(); else setSel(null); return; }
-      if (typing) return;
+      if (typing || mode !== "list") return;
       if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); setCursor((c) => Math.min(c + 1, rows.length - 1)); }
       if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); setCursor((c) => Math.max(c - 1, 0)); }
       if (e.key === "Enter" && rows[cursor]) { e.preventDefault(); void open(rows[cursor].id); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [rows, cursor, open]);
+  }, [rows, cursor, open, mode]);
 
-  const act = async (kind: "pin" | "save" | "forget" | "restore", row: Row, extra?: { summary?: string; details?: string }) => {
+  const act = async (op: Op, row: Row, extra?: { summary?: string; details?: string; kind?: string }) => {
     setBusy(true);
     try {
-      if (kind === "forget") {
+      if (op === "forget") {
         const reason = window.prompt(`Forget "${row.name}"?\n\nIt becomes a soft delete — you can restore it from the Forgotten view.\n\nReason:`);
         if (!reason) return;
         const r = await rpc.call("forget", { id: row.id, projectId: row.projectId, expectedVersion: row.version, reason });
         r.error ? say(`Failed: ${r.error}`) : (setSel(null), say("Forgotten — find it under Forgotten to restore"));
-      } else if (kind === "restore") {
+      } else if (op === "restore") {
         const r = await rpc.call("restore", { id: row.id, reason: "restored from the Forgotten view" });
         r.error ? say(`Failed: ${r.error}`) : (setSel(null), say("Restored as a new record (new id, version 1)"));
       } else {
         const r = await rpc.call("update", {
           id: row.id, projectId: row.projectId, expectedVersion: row.version,
-          reason: kind === "pin" ? (row.pinned ? "memory-ui: unpin" : "memory-ui: pin") : "memory-ui: manual edit",
+          reason: op === "kind" ? `memory-ui: reclassify ${row.kind} → ${extra?.kind}` : "memory-ui: manual edit",
           summary: extra?.summary ?? null, details: extra?.details ?? null,
-          pinned: kind === "pin" ? !row.pinned : null, importance: null,
+          kind: (op === "kind" ? (extra?.kind as (typeof KINDS)[number]) : null) ?? null,
+          importance: null,
         });
         if (r.error) say(`Failed: ${r.error}`);
-        else if (kind === "save") say("Saved");
+        else if (op === "save") say("Saved");
+        else { say(`Now a ${extra?.kind}`); await open(row.id); }
       }
       await load();
       await refreshStats();
@@ -141,107 +188,133 @@ function MemoryPanel() {
       {/* Sidebar: the shape of the store, as clickable numbers. */}
       <div className="w-52 shrink-0 border-r border-border overflow-y-auto p-2 space-y-3">
         <div className="space-y-0.5">
-          <SideItem label="All memories" count={stats?.active} active={view === "active" && !projectId && scope === "all"}
-            onClick={() => { setView("active"); setProjectId(null); setScope("all"); }} />
-          <SideItem label="Pinned" count={stats?.pinned} active={view === "pinned"} onClick={() => setView("pinned")} />
-          {/* Not "Never used": pinned records read as never-used because they are
-              injected rather than recalled, and a record written yesterday has
-              not had its chance yet. Both are excluded, so the label says so. */}
-          <SideItem label="Unused 7d+" count={stats?.unused} active={view === "unused"} onClick={() => setView("unused")} />
-          <SideItem label="Forgotten" count={stats?.forgotten} active={view === "forgotten"} onClick={() => setView("forgotten")} muted />
+          <SideItem label="All memories" count={stats?.active}
+            active={mode === "list" && view === "active" && !projectId && scope === "all"}
+            onClick={() => { setMode("list"); setView("active"); setProjectId(null); setScope("all"); }} />
+          {/* Was "Pinned". A pin was a flag someone had to remember to tick, and
+              nobody did; `kind = 'decision'` is the same protection derived from
+              what the record SAYS, which is the only version of it that keeps
+              working when no human is watching. */}
+          <SideItem label="Standing" count={stats?.standing} active={mode === "list" && view === "standing"}
+            onClick={() => goList("standing")} />
+          {/* Not "Never used": standing instructions read as never-used because
+              they are injected rather than recalled, and a record written
+              yesterday has not had its chance yet. Both are excluded, so the
+              label says so. */}
+          <SideItem label="Unused 7d+" count={stats?.unused} active={mode === "list" && view === "unused"}
+            onClick={() => goList("unused")} />
+          <SideItem label="Forgotten" count={stats?.forgotten} active={mode === "list" && view === "forgotten"}
+            onClick={() => goList("forgotten")} muted />
+        </div>
+        <div className="space-y-0.5">
+          <div className="px-2 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">Curation</div>
+          <SideItem label="Sweep" active={mode === "sweep"} onClick={() => { setMode("sweep"); setSel(null); }} />
         </div>
         <div className="space-y-0.5">
           <div className="px-2 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">Scope</div>
-          <SideItem label="Global" count={stats?.global} active={scope === "global"}
-            onClick={() => { setScope(scope === "global" ? "all" : "global"); setProjectId(null); setView("active"); }} />
+          <SideItem label="Global" count={stats?.global} active={mode === "list" && scope === "global"}
+            onClick={() => { setMode("list"); setScope(scope === "global" ? "all" : "global"); setProjectId(null); setView("active"); }} />
           {stats?.projects.map((p) => (
-            <SideItem key={p.projectId} label={p.name} count={p.count} active={projectId === p.projectId}
-              onClick={() => { setProjectId(projectId === p.projectId ? null : p.projectId); setScope("all"); setView("active"); }} />
+            <SideItem key={p.projectId} label={p.name} count={p.count} active={mode === "list" && projectId === p.projectId}
+              onClick={() => { setMode("list"); setProjectId(projectId === p.projectId ? null : p.projectId); setScope("all"); setView("active"); }} />
           ))}
         </div>
       </div>
 
-      {/* List */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2">
-        <div className="flex items-center gap-2">
-          <input ref={searchRef} value={q} onChange={(e) => setQ(e.target.value)}
-            placeholder="Search…  (press / )"
-            className="h-8 flex-1 rounded-md border border-border bg-background px-2 text-sm" />
-          <select value={sort} onChange={(e) => setSort(e.target.value as Sort)}
-            className="h-8 rounded-md border border-border bg-background px-1 text-xs">
-            <option value="recent">recent</option>
-            <option value="used">most used</option>
-            <option value="name">name</option>
-          </select>
-        </div>
-
-        {view === "forgotten" && (
-          <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            Soft-deleted records, newest first — including everything the nightly curation removed.
-            Restore re-adds the content as a <strong>new record</strong> (new id, version 1); the original stays here as history.
+      {mode === "sweep" ? (
+        <SweepView onOpen={open} />
+      ) : (
+        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <input ref={searchRef} value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Search…  (press / )"
+              className="h-8 flex-1 rounded-md border border-border bg-background px-2 text-sm" />
+            <select value={sort} onChange={(e) => setSort(e.target.value as Sort)}
+              className="h-8 rounded-md border border-border bg-background px-1 text-xs">
+              <option value="recent">recent</option>
+              <option value="used">most used</option>
+              <option value="name">name</option>
+            </select>
           </div>
-        )}
 
-        {rows.length === 0 && (
-          <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {q
-              ? `Nothing matches “${q}”.`
-              : view === "unused"
-                // An empty delete-me list reads as broken unless it says why it
-                // is empty: pinned records are excluded (they are injected, never
-                // recalled, so their counter cannot move) and so is anything under
-                // a week old. This store was migrated on 9 Aug, so for now that is
-                // everything.
-                ? "Nothing here — pinned memories and anything written in the last 7 days are excluded, and this store was migrated on 9 Aug."
-                : "Nothing here."}
-          </div>
-        )}
+          {view === "forgotten" && (
+            <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              Soft-deleted records, newest first — including everything the nightly curation removed.
+              Restore re-adds the content as a <strong>new record</strong> (new id, version 1); the original stays here as history.
+            </div>
+          )}
+          {view === "standing" && (
+            <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              Instructions you gave this machine, not facts it learned. The nightly curation may tighten,
+              merge or correct one — it may never drop what it requires.
+            </div>
+          )}
 
-        <div className="space-y-1">
-          {rows.map((r, i) => (
-            <button key={r.id} onClick={() => { setCursor(i); void open(r.id); }}
-              className={`block w-full rounded-md border px-3 py-2 text-left hover:bg-accent ${
-                sel?.row?.id === r.id ? "border-primary" : i === cursor ? "border-border bg-accent/40" : "border-border bg-card"
-              }`}>
-              <div className="flex items-center gap-2">
-                {r.pinned && <span title="pinned">📌</span>}
-                <span className={`truncate text-sm ${r.deleted ? "text-muted-foreground line-through" : "text-foreground"}`}>
-                  {r.name}
-                </span>
-                {/* With ~1,000 project records across a dozen projects, "which
-                    project is this?" is the one piece of context the row cannot
-                    do without — but only when the list is not already scoped. */}
-                {!projectId && r.projectId && (
-                  <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                    {projName(r.projectId)}
+          {rows.length === 0 && (
+            <div className="px-2 py-8 text-center text-sm text-muted-foreground">
+              {q
+                ? `Nothing matches “${q}”.`
+                : view === "unused"
+                  // An empty delete-me list reads as broken unless it says why.
+                  ? "Nothing here — standing instructions and anything written in the last 7 days are excluded."
+                  : view === "standing"
+                    ? "No standing instructions yet. Set a record's kind to “decision” to mark one."
+                    : "Nothing here."}
+            </div>
+          )}
+
+          <div className="space-y-1">
+            {rows.map((r, i) => (
+              <button key={r.id} onClick={() => { setCursor(i); void open(r.id); }}
+                className={`block w-full rounded-md border px-3 py-2 text-left hover:bg-accent ${
+                  sel?.row?.id === r.id ? "border-primary" : i === cursor ? "border-border bg-accent/40" : "border-border bg-card"
+                }`}>
+                <div className="flex items-center gap-2">
+                  <span className={`truncate text-sm ${r.deleted ? "text-muted-foreground line-through" : "text-foreground"}`}>
+                    {r.name}
                   </span>
-                )}
-                <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
-                  {r.deleted
-                    ? `forgotten ${ago(r.deletedAt)}`
-                    : r.accessCount > 0
-                      ? `used ${r.accessCount}× · ${ago(r.lastAccessedAt)}`
-                      : "never used"}
-                </span>
-              </div>
-              <div className="line-clamp-2 text-xs text-muted-foreground">{r.summary}</div>
-            </button>
-          ))}
-        </div>
+                  {/* 92% of records are 'fact', so the badge would be wallpaper.
+                      Shown only when it carries information. */}
+                  {r.kind !== "fact" && (
+                    <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                      r.kind === "decision" ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+                    }`}>{r.kind}</span>
+                  )}
+                  {/* With ~1,000 project records across a dozen projects, "which
+                      project is this?" is the one piece of context the row cannot
+                      do without — but only when the list is not already scoped. */}
+                  {!projectId && r.projectId && (
+                    <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {projName(r.projectId)}
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
+                    {r.deleted
+                      ? `forgotten ${ago(r.deletedAt)}`
+                      : r.accessCount > 0
+                        ? `used ${r.accessCount}× · ${ago(r.lastAccessedAt)}`
+                        : "never used"}
+                  </span>
+                </div>
+                <div className="line-clamp-2 text-xs text-muted-foreground">{r.summary}</div>
+              </button>
+            ))}
+          </div>
 
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <button disabled={offset === 0} onClick={() => { const o = Math.max(0, offset - PAGE); setOffset(o); void load(o); }}
-            className="rounded border border-border px-2 py-1 disabled:opacity-40">← prev</button>
-          <span>{total === 0 ? 0 : offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
-          <button disabled={offset + PAGE >= total} onClick={() => { const o = offset + PAGE; setOffset(o); void load(o); }}
-            className="rounded border border-border px-2 py-1 disabled:opacity-40">next →</button>
-          <span className="ml-auto opacity-60">j/k move · enter open · / search · esc close</span>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <button disabled={offset === 0} onClick={() => { const o = Math.max(0, offset - PAGE); setOffset(o); void load(o); }}
+              className="rounded border border-border px-2 py-1 disabled:opacity-40">← prev</button>
+            <span>{total === 0 ? 0 : offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+            <button disabled={offset + PAGE >= total} onClick={() => { const o = offset + PAGE; setOffset(o); void load(o); }}
+              className="rounded border border-border px-2 py-1 disabled:opacity-40">next →</button>
+            <span className="ml-auto opacity-60">j/k move · enter open · / search · esc close</span>
+          </div>
         </div>
-      </div>
+      )}
 
       {sel?.row && (
         <DetailPane sel={sel} busy={busy} projectLabel={projName(sel.row.projectId)}
-          onClose={() => setSel(null)} onAct={act} />
+          onClose={() => setSel(null)} onAct={act} onOpen={open} />
       )}
 
       {toast && (
@@ -253,9 +326,178 @@ function MemoryPanel() {
   );
 }
 
-function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
+// SWEEP — the activity log the store always had and never showed.
+function SweepView({ onOpen }: { onOpen: (id: string) => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [days, setDays] = useState(14);
+  const [data, setData] = useState<Sweep | null>(null);
+  const [openRun, setOpenRun] = useState<string | null>(null);
+  const [changes, setChanges] = useState<{ rows: Change[]; total: number } | null>(null);
+  const [showAll, setShowAll] = useState(false);
+
+  const reload = useCallback(async () => setData((await rpc.call("sweep", { days })) as Sweep), [days]);
+  useEffect(() => { void reload(); }, [reload]);
+  useRealtime("memory-ui.changed", () => { void reload(); });
+
+  const expand = async (run: Run) => {
+    if (openRun === run.key) { setOpenRun(null); setChanges(null); return; }
+    setOpenRun(run.key);
+    setChanges(null);
+    const r = (await rpc.call("runChanges", {
+      threadId: run.threadId, from: run.startedAt, to: run.endedAt, limit: 200,
+    })) as { changes: Change[]; total: number };
+    setChanges({ rows: r.changes, total: r.total });
+  };
+
+  const pct = data && data.active > 0 ? Math.round((data.touched / data.active) * 100) : 0;
+
+  // Default to runs that CHANGED existing memory. Measured over 14 days of real
+  // history: 60 runs, and 8 of the 10 most recent were a single agent saving one
+  // new memory — which buried the curation entirely, and is the one thing this
+  // view exists to show. The discriminator is shape, not size: curation rewrites
+  // and deletes, ordinary work only adds. A one-record rewrite is an agent
+  // correcting something it had wrong, which is worth seeing; a one-record
+  // create is visible in the main list already.
+  const allRuns = data?.runs ?? [];
+  const runs = showAll ? allRuns : allRuns.filter((r) => r.updates + r.forgets > 0);
+  const hidden = allRuns.length - runs.length;
+  // Two most recent substantial runs: if the newer one did not reach further
+  // into the queue than the older one, the sweep is re-reading the same records.
+  const sweeps = allRuns.filter((r) => r.updates >= 10 && r.queueTo != null);
+  const stalled = sweeps.length >= 2 && (sweeps[0].queueTo ?? 0) <= (sweeps[1].queueTo ?? 0);
+
+  return (
+    <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="text-sm font-medium text-foreground">Sweep</div>
+        {hidden > 0 && !showAll && (
+          <button onClick={() => setShowAll(true)} className="text-xs text-muted-foreground underline decoration-dotted">
+            + {hidden} run{hidden > 1 ? "s" : ""} that only added memories
+          </button>
+        )}
+        {showAll && (
+          <button onClick={() => setShowAll(false)} className="text-xs text-muted-foreground underline decoration-dotted">
+            rewrites &amp; deletions only
+          </button>
+        )}
+        <select value={days} onChange={(e) => setDays(Number(e.target.value))}
+          className="ml-auto h-8 rounded-md border border-border bg-background px-1 text-xs">
+          <option value={7}>last 7 days</option>
+          <option value={14}>last 14 days</option>
+          <option value={30}>last 30 days</option>
+          <option value={90}>last 90 days</option>
+        </select>
+      </div>
+
+      {data && (
+        <div className="rounded-md border border-border bg-card p-3 space-y-2">
+          <div className="flex items-baseline gap-2 text-sm">
+            <span className="text-foreground">{data.touched.toLocaleString()}</span>
+            {/* "rewritten", not "curated": a bulk backfill lands in this number
+                the same way a nightly curation does, and the store cannot tell
+                you which. Overstating it here would turn the one honest view
+                into a reassuring one. */}
+            <span className="text-muted-foreground">of {data.active.toLocaleString()} records have been rewritten at least once</span>
+            <span className="ml-auto tabular-nums text-xs text-muted-foreground">{pct}%</span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span>oldest record last touched <strong className="text-foreground">{ago(data.frontier)}</strong> — that is where the next sweep starts</span>
+            <span>{data.forgotten.toLocaleString()} forgotten in total</span>
+          </div>
+          {stalled && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+              The last sweep did not reach further into the queue than the one before it — it is
+              re-reading records it has already curated, so the backlog is not shrinking.
+            </div>
+          )}
+        </div>
+      )}
+
+      {data && runs.length === 0 && (
+        <div className="px-2 py-8 text-center text-sm text-muted-foreground">
+          {allRuns.length === 0
+            ? "Nothing has written to memory in this window."
+            : "Nothing rewrote or deleted an existing memory in this window — only new ones were added."}
+        </div>
+      )}
+
+      <div className="space-y-1">
+        {runs.map((run) => (
+          <div key={run.key} className="rounded-md border border-border bg-card">
+            <button onClick={() => void expand(run)} className="block w-full px-3 py-2 text-left hover:bg-accent/50">
+              <div className="flex items-center gap-2">
+                <span className="truncate text-sm text-foreground">
+                  {run.title ?? run.threadId ?? "unattributed"}
+                </span>
+                <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{clock(run.endedAt)}</span>
+              </div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] tabular-nums">
+                {run.creates > 0 && <span className="text-muted-foreground">+{run.creates} new</span>}
+                {run.updates > 0 && <span className="text-muted-foreground">~{run.updates} rewritten</span>}
+                {run.forgets > 0 && <span className="text-destructive">−{run.forgets} forgotten</span>}
+                {run.queueFrom != null && (
+                  // Only meaningful for a batch: one interactive edit "covers"
+                  // a one-record window, which is noise.
+                  run.updates >= 10 && (
+                    <span className="text-muted-foreground opacity-70">
+                      covered records last touched {day(run.queueFrom)} → {day(run.queueTo)}
+                    </span>
+                  )
+                )}
+              </div>
+            </button>
+
+            {openRun === run.key && (
+              <div className="border-t border-border px-3 py-2 space-y-1">
+                {!changes && <div className="text-xs text-muted-foreground">loading…</div>}
+                {changes?.rows.map((c, i) => (
+                  <div key={`${c.memoryId}-${c.at}-${i}`} className="text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className={`shrink-0 rounded px-1 py-0.5 text-[10px] ${
+                        c.action === "forget" ? "bg-destructive/15 text-destructive"
+                          : c.action === "create" ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+                      }`}>{c.action}</span>
+                      <button onClick={() => onOpen(c.memoryId)}
+                        className={`truncate text-left hover:underline ${c.deleted ? "text-muted-foreground line-through" : "text-foreground"}`}>
+                        {c.name}
+                      </button>
+                    </div>
+                    {c.reason && (
+                      <div className="pl-1 text-muted-foreground"><Reason text={c.reason} onOpen={onOpen} /></div>
+                    )}
+                  </div>
+                ))}
+                {changes && changes.total > changes.rows.length && (
+                  <div className="text-xs text-muted-foreground opacity-70">
+                    showing {changes.rows.length} of {changes.total} changes in this run
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Said plainly rather than left to be discovered: the nightly curation
+          caps how many records it may delete in one run, and the proposals that
+          cap refuses never reach this database at all. They are in the workflow's
+          own report. A view that silently omitted them would read as "this is
+          everything that happened". */}
+      <div className="pt-1 text-[11px] text-muted-foreground opacity-70">
+        Deletions the nightly cap refused are not shown here — they were never written, so no record of
+        them exists in the store. The curation run's own report has them.
+      </div>
+    </div>
+  );
+}
+
+function DetailPane({ sel, busy, projectLabel, onClose, onAct, onOpen }: {
   sel: Detail; busy: boolean; projectLabel: string; onClose: () => void;
-  onAct: (k: "pin" | "save" | "forget" | "restore", row: Row, extra?: { summary?: string; details?: string }) => Promise<void>;
+  onAct: (op: Op, row: Row, extra?: { summary?: string; details?: string; kind?: string }) => Promise<void>;
+  onOpen: (id: string) => void;
 }) {
   const row = sel.row!;
   const [summary, setSummary] = useState(row.summary);
@@ -287,7 +529,7 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
       {row.deleted ? (
         <>
           <div className="rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
-            {sel.writeReason ? <>Forgotten because: <em>{sel.writeReason}</em></> : "Forgotten."}
+            {sel.writeReason ? <>Forgotten because: <em><Reason text={sel.writeReason} onOpen={onOpen} /></em></> : "Forgotten."}
           </div>
           <div className="whitespace-pre-wrap rounded-md border border-border bg-background p-2 text-xs">{sel.details ?? row.summary}</div>
           <button disabled={busy} onClick={() => void onAct("restore", row)}
@@ -297,6 +539,22 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
         </>
       ) : (
         <>
+          {/* This replaced the Pin button. Not the same gesture renamed: a pin
+              was UI state that meant nothing to anything else, while `kind` is
+              part of the record — it is what the curation rules read, so setting
+              it to "decision" is what actually protects the record from being
+              curated away. */}
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            kind
+            <select value={row.kind} disabled={busy}
+              onChange={(e) => void onAct("kind", row, { kind: e.target.value })}
+              className="h-7 rounded-md border border-border bg-background px-1 text-xs">
+              {KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+            </select>
+            {row.kind === "decision" && (
+              <span className="text-[11px] text-primary">the nightly sweep may not drop this</span>
+            )}
+          </label>
           <label className="block text-xs text-muted-foreground">summary
             <textarea value={summary} onChange={(e) => setSummary(e.target.value)} rows={4}
               className="mt-1 w-full rounded-md border border-border bg-background p-2 text-sm" />
@@ -312,8 +570,6 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
                 details: details !== (sel.details ?? "") ? details : undefined,
               })}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-40">Save</button>
-            <button disabled={busy} onClick={() => void onAct("pin", row)}
-              className="rounded-md border border-border px-3 py-1.5 text-sm">{row.pinned ? "Unpin" : "Pin"}</button>
             <button disabled={busy} onClick={() => void onAct("forget", row)}
               className="ml-auto rounded-md border border-destructive px-3 py-1.5 text-sm text-destructive">Forget…</button>
           </div>
@@ -324,7 +580,9 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
         <div className="space-y-1 text-xs text-muted-foreground">
           <div className="font-medium">history</div>
           {sel.history.map((h) => (
-            <div key={h.version} className="truncate">v{h.version} · {ago(h.at)} · {h.reason ?? ""}</div>
+            <div key={h.version} className="truncate">
+              v{h.version} · {ago(h.at)} · {h.reason ? <Reason text={h.reason} onOpen={onOpen} /> : null}
+            </div>
           ))}
         </div>
       )}
@@ -332,11 +590,14 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct }: {
   );
 }
 
-function PinnedSection() {
+// Homepage: the standing instructions, which is what the pinned section was
+// reaching for. Pinning required someone to maintain a flag; this is derived
+// from the records themselves, so it is right by default and cannot go stale.
+function StandingSection() {
   const rpc = useRpc<typeof rpcContract>();
   const [rows, setRows] = useState<Row[]>([]);
   useEffect(() => {
-    void rpc.call("list", { scope: "all", projectId: null, q: "", view: "pinned", sort: "recent", limit: 6, offset: 0 })
+    void rpc.call("list", { scope: "all", projectId: null, q: "", view: "standing", sort: "recent", limit: 6, offset: 0 })
       .then((r) => setRows(r.rows as Row[]));
   }, []);
   if (!rows.length) return null;
@@ -344,7 +605,7 @@ function PinnedSection() {
     <div className="space-y-1">
       {rows.map((r) => (
         <div key={r.id} className="rounded-md border border-border bg-card px-3 py-2">
-          <div className="text-sm text-foreground">📌 {r.name}</div>
+          <div className="text-sm text-foreground">{r.name}</div>
           <div className="line-clamp-2 text-xs text-muted-foreground">{r.summary}</div>
         </div>
       ))}
@@ -354,5 +615,5 @@ function PinnedSection() {
 
 export default definePluginApp((app) => {
   app.slots.navPanel({ id: "memory", title: "Memory", icon: "Brain", path: "memory", component: MemoryPanel });
-  app.slots.homepageSection({ id: "pinned-memories", title: "Pinned memories", component: PinnedSection });
+  app.slots.homepageSection({ id: "standing-memories", title: "Standing instructions", component: StandingSection });
 });

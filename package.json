@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Memory UI",
-    "description": "Browse, search, edit, pin, and forget bb memories \u2014 nav panel with FTS search + history, pinned homepage section.",
+    "description": "Browse, search, edit and forget bb memories \u2014 FTS search, per-record history, and a Sweep view of what has been rewriting the store.",
     "branding": {
       "icon": "Brain"
     },
