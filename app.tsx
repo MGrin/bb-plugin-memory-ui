@@ -253,6 +253,31 @@ function MemoryPanel() {
     }
   };
 
+  const move = async (row: Row, toProjectId: string | null, label: string) => {
+    const reason = window.prompt(
+      `Move "${row.name}" to ${label}?\n\nWhy does it belong there?`,
+      `Re-scoped to ${label}: the fact is specific to it.`,
+    );
+    if (!reason) return;
+    setBusy(true);
+    try {
+      const r = await rpc.call("move", {
+        id: row.id, expectedVersion: row.version,
+        fromProjectId: row.projectId, toProjectId, reason,
+      });
+      if (r.error) { say(`Failed: ${r.error}`); return; }
+      // The two paths differ in a way the user has to know about: one keeps the
+      // record, the other replaces it. Saying "Moved" for both would quietly
+      // hide that every reference to the old id just broke.
+      if (r.keptId) { say(`Moved to ${label} — same record, history intact`); await open(row.id); }
+      else { say(`Moved to ${label} as a NEW record (${r.newId}); the original is in Forgotten`); close(); }
+      await load();
+      await refreshStats();
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const projName = (id: string | null) =>
     id ? (stats?.projects.find((p) => p.projectId === id)?.name ?? "project") : "global";
 
@@ -415,6 +440,7 @@ function MemoryPanel() {
         </div>
       ) : sel?.row ? (
         <DetailPane sel={sel} busy={busy} projectLabel={projName(sel.row.projectId)}
+          projects={stats?.projects ?? []} onMove={move}
           onClose={close} onAct={act} onOpen={open} />
       ) : null}
 
@@ -742,8 +768,11 @@ function ClustersView({ onOpen }: { onOpen: (id: string) => void }) {
   );
 }
 
-function DetailPane({ sel, busy, projectLabel, onClose, onAct, onOpen }: {
-  sel: Detail; busy: boolean; projectLabel: string; onClose: () => void;
+function DetailPane({ sel, busy, projectLabel, projects, onMove, onClose, onAct, onOpen }: {
+  sel: Detail; busy: boolean; projectLabel: string;
+  projects: { projectId: string; name: string; count: number }[];
+  onMove: (row: Row, toProjectId: string | null, label: string) => Promise<void>;
+  onClose: () => void;
   onAct: (op: Op, row: Row, extra?: { summary?: string; details?: string; kind?: string }) => Promise<void>;
   onOpen: (id: string) => void;
 }) {
@@ -803,6 +832,25 @@ function DetailPane({ sel, busy, projectLabel, onClose, onAct, onOpen }: {
               <span className="text-[11px] text-primary">the nightly sweep may not drop this</span>
             )}
           </label>
+          {/* Scope is metadata about where a fact belongs, not part of the fact,
+              so it belongs next to `kind` rather than behind a scripted repair.
+              A store with no way to fix scope is a store that quietly gets
+              worse: 81 records here were global while being about one repo. */}
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            scope
+            <select value={row.projectId ?? ""} disabled={busy}
+              onChange={(e) => {
+                const id = e.target.value || null;
+                void onMove(row, id, id ? (projects.find((p) => p.projectId === id)?.name ?? id) : "global");
+              }}
+              className="h-7 min-w-0 flex-1 rounded-md border border-border bg-background px-1 text-xs">
+              <option value="">global</option>
+              {projects.map((p) => (
+                <option key={p.projectId} value={p.projectId}>{p.name}</option>
+              ))}
+            </select>
+          </label>
+
           <label className="block text-xs text-muted-foreground">summary
             <textarea value={summary} onChange={(e) => setSummary(e.target.value)} rows={4}
               className="mt-1 w-full rounded-md border border-border bg-background p-2 text-sm" />

@@ -269,6 +269,27 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ ok: z.boolean(), error: z.string().nullable() }),
   },
+  // Re-scope a memory. Prefers `bb memory move` (which keeps the id, the
+  // version lineage and the history) and falls back to add-then-forget on a bb
+  // that does not have it yet — see the handler for why the fallback is worth
+  // having rather than just refusing.
+  move: {
+    input: z
+      .object({
+        id: z.string(),
+        expectedVersion: z.number().int(),
+        fromProjectId: z.string().nullable(),
+        toProjectId: z.string().nullable(), // null = global
+        reason: z.string().min(3),
+      })
+      .strict(),
+    output: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      newId: z.string().nullable(),
+      keptId: z.boolean(),
+    }),
+  },
   restore: {
     input: z.object({ id: z.string(), reason: z.string().min(3) }).strict(),
     output: z.object({ ok: z.boolean(), error: z.string().nullable(), newId: z.string().nullable() }),
@@ -707,6 +728,105 @@ export default async function plugin(bb: BbPluginApi) {
       );
       if (res.ok) bb.realtime.publish("memory-ui.changed", { id: input.id });
       return { ok: res.ok, error: res.error };
+    },
+
+    // MOVE. Two implementations, and the difference matters enough to say in
+    // the UI: the native `bb memory move` keeps the record's id, version
+    // lineage and history, while the fallback cannot — it adds a copy in the
+    // target scope and forgets the original, so the id changes and the history
+    // stays behind on the tombstone.
+    //
+    // The fallback exists because the alternative is refusing to work at all on
+    // every bb that predates the move command, and re-scoping is exactly the
+    // repair a store needs most when it has never had the tool for it. It
+    // records the old id in the new record and the new id in the forget reason,
+    // so the chain stays followable — this UI linkifies mem_ ids.
+    async move(input) {
+      const target = input.toProjectId
+        ? ["--to-project", input.toProjectId]
+        : ["--to-global"];
+      const native = await bbMemory(
+        ["move", input.id, "--expected-version", String(input.expectedVersion),
+         "--reason", input.reason, ...target],
+        input.fromProjectId,
+      );
+      if (native.ok) {
+        bb.realtime.publish("memory-ui.changed", { id: input.id });
+        return { ok: true, error: null, newId: null, keptId: true };
+      }
+      // Only fall back for a bb that lacks the command. A version conflict or a
+      // name collision is a real refusal and must not be retried as a copy —
+      // that would turn "this name is taken" into two records with one name.
+      if (!/unknown subcommand|unknown command/i.test(native.error ?? "")) {
+        return { ok: false, error: native.error, newId: null, keptId: true };
+      }
+
+      const rows = await sq<MemRow & { details: string | null }>(
+        `SELECT * FROM memories WHERE id = ${q1(input.id)} AND deleted_at IS NULL`,
+      );
+      const r = rows[0];
+      if (!r) return { ok: false, error: "record not found", newId: null, keptId: true };
+
+      // CHECK THE VERSION BEFORE WRITING ANYTHING. The native path gets this
+      // free — the move is one transaction that either happens or does not. The
+      // fallback is add-then-forget, so a stale version discovered at the forget
+      // leaves the copy behind and the original alive: one fact, two records,
+      // which is worse than the mis-scoping being repaired.
+      //
+      // Caught by its own test: on a bb without the move command every native
+      // call fails with "unknown subcommand" whatever the real problem is, so a
+      // deliberately stale version fell straight through the fallback and
+      // duplicated the record.
+      if (r.version !== input.expectedVersion) {
+        return {
+          ok: false,
+          error: `version conflict for ${input.id}: expected ${input.expectedVersion}, current ${r.version}`,
+          newId: null,
+          keptId: true,
+        };
+      }
+      const targetScopeKey = input.toProjectId ? `project:${input.toProjectId}` : "global";
+      const clash = await sq<{ id: string }>(
+        `SELECT id FROM memories WHERE scope_key = ${q1(targetScopeKey)}
+           AND name = ${q1(r.name)} AND deleted_at IS NULL AND id <> ${q1(input.id)}`,
+      );
+      if (clash[0]) {
+        return {
+          ok: false,
+          error: `a memory named "${r.name}" already exists in the target scope (${clash[0].id})`,
+          newId: null,
+          keptId: true,
+        };
+      }
+      const tags = r.tags_json ? (JSON.parse(r.tags_json) as string[]) : [];
+      const added = await bbMemory(
+        ["add", "--scope", input.toProjectId ? "project" : "global",
+         "--name", r.name, "--summary", r.summary,
+         "--details", `${r.details ?? r.summary}\n\nre-scoped: was ${r.project_id ?? "global"} as ${input.id}.`,
+         "--kind", r.kind ?? "fact", "--importance", String(r.importance ?? 50),
+         "--reason", input.reason,
+         ...tags.flatMap((t) => ["--tag", t])],
+        input.toProjectId,
+      );
+      if (!added.ok || !added.id) {
+        return { ok: false, error: added.error ?? "add failed", newId: null, keptId: false };
+      }
+      const forgotten = await bbMemory(
+        ["forget", input.id, "--expected-version", String(input.expectedVersion),
+         "--reason", `Re-scoped to ${added.id}, same content.`],
+        input.fromProjectId,
+      );
+      bb.realtime.publish("memory-ui.changed", { id: input.id });
+      if (!forgotten.ok) {
+        // Say it plainly: the copy exists and the original does not know.
+        return {
+          ok: false,
+          error: `copied to ${added.id} but the original could not be forgotten (${forgotten.error}) — both now exist`,
+          newId: added.id,
+          keptId: false,
+        };
+      }
+      return { ok: true, error: null, newId: added.id, keptId: false };
     },
 
     // Restore re-ADDS the record through `bb memory add` rather than clearing
