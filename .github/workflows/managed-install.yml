@@ -1,0 +1,52 @@
+# Proves this plugin is installable with `bb plugin install git:…`.
+#
+# bb's managed git install resolves runtime dependencies ONLY
+# (`npm install --omit=dev --omit=optional --ignore-scripts`) and then runs
+# `bb plugin build`, which inlines every import except @bb/plugin-sdk,
+# better-sqlite3 and node builtins. A runtime import parked in
+# devDependencies therefore builds fine in a clone and fails for every real
+# user. This job reproduces that exact sequence so the asymmetry cannot come
+# back silently.
+name: Managed install
+
+on:
+  pull_request:
+  push:
+    branches: [main, main-public]
+  workflow_dispatch:
+
+jobs:
+  managed-install:
+    name: git install builds with runtime deps only
+    runs-on: ubuntu-latest
+    env:
+      BB_VERSION: "0.36.0"
+      BB_DATA_DIR: ${{ github.workspace }}/.bb-data
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache the bb plugin build toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.bb-data/plugins
+          key: bb-toolchain-${{ runner.os }}-${{ env.BB_VERSION }}
+
+      - name: Install runtime dependencies only (as bb's managed install does)
+        run: npm install --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund
+
+      - name: Build the plugin bundles
+        run: npx --yes --package "bb-app@${BB_VERSION}" bb plugin build .
+
+      - name: Assert the install artifacts exist
+        run: |
+          for artifact in dist/server.js dist/server.meta.json dist/app.js dist/app.css dist/app.meta.json; do
+            if [ ! -s "$artifact" ]; then
+              echo "::error::$artifact was not produced — the plugin is not installable from git:"
+              exit 1
+            fi
+            echo "ok  $artifact"
+          done
