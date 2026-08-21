@@ -12,7 +12,7 @@
 // It is that an agent rewrites and deletes records here every night, and until
 // now the only trace was a per-record history you had to already suspect.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 type Row = {
