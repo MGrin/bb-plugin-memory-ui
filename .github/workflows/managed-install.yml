@@ -20,7 +20,7 @@ jobs:
     name: git install builds with runtime deps only
     runs-on: ubuntu-latest
     env:
-      BB_VERSION: "0.36.0"
+      BB_VERSION: "0.39.0"
       BB_DATA_DIR: ${{ github.workspace }}/.bb-data
     steps:
       - uses: actions/checkout@v4
