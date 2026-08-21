@@ -32,7 +32,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import os from "node:os";
 import { promisify } from "node:util";
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 const run = promisify(execFile);

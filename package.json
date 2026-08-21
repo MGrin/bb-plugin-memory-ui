@@ -4,7 +4,7 @@
   "type": "module",
   "engines": {
     "bb": ">=0.36",
-    "bbPluginSdk": "^0.4.1"
+    "bbPluginSdk": ">=0.4.8"
   },
   "bb": {
     "name": "Memory UI",
@@ -25,6 +25,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
     "@radix-ui/react-dialog": "^1.1.19",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
