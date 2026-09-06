@@ -352,7 +352,7 @@ async function bbMemory(args: string[], projectId: string | null) {
 }
 
 /**
- * Which commit is this PROCESS running? (MX-139/MX-141)
+ * Which commit is this PROCESS running?
  *
  * bb bundles a `path:` plugin FROM SOURCE at reload, so a revision read here — at module
  * load, the same moment — is by construction the code now executing. Nothing else can say:
@@ -624,7 +624,7 @@ export default async function plugin(bb: BbPluginApi) {
       runs.sort((a, b) => b.endedAt - a.endedAt);
       const page = runs.slice(0, 60);
       // Titles are what make a run readable — "dream — memory curation 2026-08-11"
-      // versus `thr_ndhunrpsek`. Best effort per run: a thread can be archived or
+      // versus `thr_example001`. Best effort per run: a thread can be archived or
       // deleted while its writes remain, and one missing title must not blank the
       // whole view.
       // Cached across calls. Without this, opening Sweep fired up to 60 internal
